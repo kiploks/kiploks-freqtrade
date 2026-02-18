@@ -1,0 +1,1 @@
+{"top_n":3,"skip_already_uploaded":true,"api_url":"https://kiploks.com","api_token":"","wfaPeriods":4,"wfaISSize":90,"wfaOOSSize":30,"epochs":10,"hyperopt_loss":"SharpeHyperOptLoss","hyperopt_result_path":""}
