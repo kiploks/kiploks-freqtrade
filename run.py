@@ -772,8 +772,9 @@ def _print_integration_summary(
     can_upload: bool,
     upload_ok: bool,
     analyze_urls: list[str] | None = None,
+    deferred_lines: list[str] | None = None,
 ) -> None:
-    """Print integration summary: each result block first, then ADVANCED ANALYSIS header above the links, then links."""
+    """Print integration summary: each result block first, then any deferred upload/storage lines above the header, then ADVANCED ANALYSIS header, then links."""
     sep = "-----------------------------------------"
     n = len(items)
     urls = analyze_urls or []
@@ -782,6 +783,10 @@ def _print_integration_summary(
             print(f"--- Result {i + 1}/{n} ---", file=sys.stderr)
             print(file=sys.stderr)
         _print_one_result_block(item, kiploks_config)
+        print(file=sys.stderr)
+    if deferred_lines:
+        for line in deferred_lines:
+            print(line, file=sys.stderr)
         print(file=sys.stderr)
     print("ADVANCED ANALYSIS (Kiploks Cloud)", file=sys.stderr)
     print(sep, file=sys.stderr)
@@ -2725,13 +2730,20 @@ def _fetch_analyze_status(api_url: str, api_token: str) -> dict | None:
     return None
 
 
-def _log_analyze_status(status: dict) -> None:
-    """Print one-line status to stderr: next request time or storage full."""
+def _log_analyze_status(
+    status: dict,
+    deferred_lines: list[str] | None = None,
+) -> None:
+    """Print one-line status to stderr, or append to deferred_lines for storage full (so it prints above ADVANCED ANALYSIS header)."""
     if status.get("storageFull"):
         used = status.get("storageUsed", "?")
         limit = status.get("storageLimit", 30)
-        print(f"   • Storage {used}/{limit} - delete some tests in Kiploks to upload new ones.", file=sys.stderr)
-        sys.stderr.flush()
+        line = f"   • Storage {used}/{limit} - delete some tests in Kiploks to upload new ones."
+        if deferred_lines is not None:
+            deferred_lines.append(line)
+        else:
+            print(line, file=sys.stderr)
+            sys.stderr.flush()
         return
     if not status.get("allowed") and status.get("retryAfterSeconds"):
         sec = status["retryAfterSeconds"]
@@ -2797,8 +2809,8 @@ def upload_to_kiploks(
     config: dict,
     *,
     api_token: str,
-) -> tuple[bool, list[str]]:
-    """POST results to Kiploks integration API. Returns (success, analyze_urls). Handles 429 (retry once) and 403 storage_limit."""
+) -> tuple[bool, list[str], list[str]]:
+    """POST results to Kiploks integration API. Returns (success, analyze_urls, error_lines to print above ADVANCED ANALYSIS). Handles 429 (retry once) and 403 storage_limit."""
     base = api_url.rstrip("/")
     url = f"{base}/api/integration/results"
     payload = {
@@ -2829,9 +2841,10 @@ def upload_to_kiploks(
                 pass
             return e.code, err_body, []
 
+    error_lines: list[str] = []
     code, err_body, urls = _do_post()
     if 200 <= code < 300:
-        return True, urls
+        return True, urls, []
 
     if code == 429 and err_body:
         retry_sec = err_body.get("retryAfterSeconds")
@@ -2841,35 +2854,34 @@ def upload_to_kiploks(
             time.sleep(retry_sec)
             code, err_body, urls = _do_post()
             if 200 <= code < 300:
-                return True, urls
+                return True, urls, []
             if code == 429:
                 print(f"   • Rate limit: still not allowed. Try again later.", file=sys.stderr)
                 sys.stderr.flush()
-                return False, []
+                return False, [], []
         else:
             print(f"   • Rate limit: only one analyze request per minute.", file=sys.stderr)
             sys.stderr.flush()
-            return False, []
+            return False, [], []
 
     if code == 403 and err_body and err_body.get("error") == "storage_limit":
         msg = err_body.get("message", "Storage limit reached.")
         current = err_body.get("currentCount", "?")
         limit = err_body.get("limit", 30)
         requested = err_body.get("requested", "?")
-        print(f"   • {msg}", file=sys.stderr)
-        print(f"   • Stored: {current}/{limit}. Requested: {requested}. Delete some tests in Kiploks.", file=sys.stderr)
-        sys.stderr.flush()
-        return False, []
+        error_lines.append(f"Upload failed: HTTP {code} (auth: {_redact_token(api_token)})")
+        error_lines.append(f"   • {msg}")
+        error_lines.append(f"   • Stored: {current}/{limit}. Requested: {requested}. Delete some tests in Kiploks.")
+        return False, [], error_lines
 
     # Do not show auth error message when token was never set (user did not configure api_token).
     if code == 401 and not (api_token and str(api_token).strip()):
-        return False, []
+        return False, [], []
 
-    print(f"Upload failed: HTTP {code} (auth: {_redact_token(api_token)})", file=sys.stderr)
+    error_lines.append(f"Upload failed: HTTP {code} (auth: {_redact_token(api_token)})")
     if err_body and err_body.get("message"):
-        print(f"   • {err_body['message']}", file=sys.stderr)
-    sys.stderr.flush()
-    return False, []
+        error_lines.append(f"   • {err_body['message']}")
+    return False, [], error_lines
 
 
 def main() -> int:
@@ -3017,11 +3029,13 @@ def main() -> int:
         can_upload = False
     upload_ok = False
     analyze_urls: list[str] = []
+    deferred_lines: list[str] = []
     if can_upload:
         status = _fetch_analyze_status(api_url, api_token)
         if status:
-            _log_analyze_status(status)
-        upload_ok, analyze_urls = upload_to_kiploks(api_url, valid_results, config, api_token=api_token)
+            _log_analyze_status(status, deferred_lines)
+        upload_ok, analyze_urls, upload_error_lines = upload_to_kiploks(api_url, valid_results, config, api_token=api_token)
+        deferred_lines.extend(upload_error_lines)
         if upload_ok and uploaded_files:
             _save_uploaded_manifest(uploaded_files)
     if isinstance(keep_n, int) and keep_n == 0:
@@ -3032,6 +3046,7 @@ def main() -> int:
         can_upload,
         upload_ok,
         analyze_urls=analyze_urls if analyze_urls else None,
+        deferred_lines=deferred_lines if deferred_lines else None,
     )
     sys.stderr.flush()
     return 0
