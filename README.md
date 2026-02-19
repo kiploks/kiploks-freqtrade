@@ -30,7 +30,7 @@ Clone the repository directly into your Freqtrade project root:
 ```bash
 # Navigate to your freqtrade project folder (containing docker-compose.yml)
 git clone https://github.com/kiploks/kiploks-freqtrade.git
-git rm -rf kiploks-freqtrade/.git
+rm -rf kiploks-freqtrade/.git
 chmod +x kiploks-freqtrade/run-in-docker.sh
 
 ```
