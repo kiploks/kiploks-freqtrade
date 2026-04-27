@@ -289,13 +289,19 @@ class TestValidateResultForKiploks(unittest.TestCase):
         self.assertFalse(ok)
         self.assertIn("walkForwardAnalysis", err)
 
-    def test_missing_or_empty_oos_trades_fails(self) -> None:
+    def test_missing_or_empty_oos_trades_allowed_with_wfa(self) -> None:
         item = self._minimal_valid_item()
         del item["oos_trades"]
         ok, err = validate_result_for_kiploks(item)
-        self.assertFalse(ok)
-        self.assertIn("oos_trades", err)
+        self.assertTrue(ok, err)
         item["oos_trades"] = []
+        ok, err = validate_result_for_kiploks(item)
+        self.assertTrue(ok, err)
+
+    def test_missing_oos_trades_and_missing_wfa_periods_fails(self) -> None:
+        item = self._minimal_valid_item()
+        del item["oos_trades"]
+        item["walkForwardAnalysis"]["periods"] = []
         ok, err = validate_result_for_kiploks(item)
         self.assertFalse(ok)
         self.assertIn("oos_trades", err)
