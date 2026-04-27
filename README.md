@@ -30,7 +30,7 @@ Clone the repository directly into your Freqtrade project root:
 ```bash
 # Navigate to your freqtrade project folder (containing docker-compose.yml)
 git clone https://github.com/kiploks/kiploks-freqtrade.git
-rm -rf kiploks-freqtrade/.git
+git rm -rf kiploks-freqtrade/.git
 chmod +x kiploks-freqtrade/run-in-docker.sh
 
 ```
@@ -75,6 +75,12 @@ Run the script from your **project root**:
 | `hyperopt_result_path` | `""` | Path to `.fthypt` file. If empty, the latest file in `user_data/` is used. |
 | `keep_last_n_backtest_files` | (not set) | Keep last N script-created backtest files (WFA). If unset or 0, they are removed after run. |
 
+Each run writes `kiploks-freqtrade/export_test_result.json` (full payload, same folder as `uploaded.json`).
+
+### Execution settings (fee & slippage)
+
+Freqtrade backtesting has a **fee** setting (`fee` or `fee_open` / `fee_close`) but **no slippage** parameter. Kiploks reads commission from the payload when present; if **slippage** is missing (as with Freqtrade), it applies a default **0.05%** (5 bps) one-way and marks the result as estimated. The analysis report will then show an **Execution Note**: *"Backtest execution settings were missing. The system applied a standard Safety Buffer (0.05% slippage, 0.1% fee)."* This is expected for Freqtrade-based analyses. To improve accuracy, the integration can optionally pass a `slippage` value in the payload (e.g. from user config or a fixed assumption). 
+
 ---
 
 ## Project Structure
@@ -117,6 +123,7 @@ ft_userdata/
 * **not found user_data folder** – Run the script from the directory that contains `user_data/` (project root with `docker-compose.yml`). Use `run-in-docker.sh` or `run-in-docker.bat` from that root.
 * **Config not found or empty** – Copy `kiploks.json.example` to `kiploks.json` in the same folder as `run.py` and set `api_url` and `api_token`.
 * **user_data/backtest_results not found** – Run Freqtrade backtesting first so that `user_data/backtest_results/` exists and contains result files.
+* **Result N: SKIP date range too short (Xd, need >= 14d)** – WFA requires at least 14 days of data to form one IS+OOS period; use a longer backtest range.
 * **FREQTRADE_CMD rejected** / **FREQTRADE_CMD is not set** – When not running inside Docker, set the `FREQTRADE_CMD` environment variable to your freqtrade invocation (e.g. `docker compose run --rm freqtrade`). Prefer running via `run-in-docker.sh` so the script runs inside the Freqtrade environment.
 * **Run this script from the Freqtrade environment** – Use Docker: `run-in-docker.sh` (Linux/macOS) or `run-in-docker.bat` (Windows) from the project root.
 

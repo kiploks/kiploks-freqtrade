@@ -1,7 +1,8 @@
 """
 Tests for run.py: legacy path (raw -> BacktestRun -> Kiploks payload) and metrics from raw["results"].
-Run: cd kiploks-freqtrade && python test_run.py
-Or: python -m pytest kiploks-freqtrade/test_run.py -v (from repo root)
+Run from repo root: npm run freqtrade-integration:test
+Or: cd kiploks-freqtrade && python3 test_run.py
+Optional: python3 -m pytest kiploks-freqtrade/test_run.py -v (requires pytest installed)
 """
 from __future__ import annotations
 
@@ -23,6 +24,7 @@ from run import (
     validate_result_for_kiploks,
 )
 from run import (
+    _freqtrade_trades_to_oos_trades,
     _parse_freqtrade_cmd,
     _path_under,
     _validate_strategy_name,
@@ -201,6 +203,26 @@ class TestValidateStrategyName(unittest.TestCase):
             _validate_strategy_name("A" + "b" * 128)
 
 
+class TestFreqtradeTradesToOosTrades(unittest.TestCase):
+    """Conversion of Freqtrade OOS trades to Kiploks oos_trades (net_return)."""
+
+    def test_profit_ratio_mapped_to_net_return(self) -> None:
+        trades = [
+            {"close_date": "2024-01-02T10:00:00", "profit_ratio": 0.01, "profit_abs": 10},
+            {"close_date": "2024-01-03T10:00:00", "profit_ratio": -0.005, "profit_abs": -5},
+        ]
+        out, balance = _freqtrade_trades_to_oos_trades(trades, initial_balance=1000.0)
+        self.assertEqual(len(out), 2)
+        self.assertEqual(out[0]["net_return"], 0.01)
+        self.assertEqual(out[1]["net_return"], -0.005)
+        self.assertEqual(balance, 1005.0)
+
+    def test_empty_trades_returns_empty(self) -> None:
+        out, balance = _freqtrade_trades_to_oos_trades([], initial_balance=1000.0)
+        self.assertEqual(out, [])
+        self.assertEqual(balance, 1000.0)
+
+
 class TestValidateResultForKiploks(unittest.TestCase):
     """validate_result_for_kiploks: contract before upload."""
 
@@ -217,6 +239,7 @@ class TestValidateResultForKiploks(unittest.TestCase):
                     {"optimizationReturn": 0.05, "validationReturn": 0.02},
                 ],
             },
+            "oos_trades": [{"net_return": 0.01}],
         }
 
     def test_valid_item_passes(self) -> None:
@@ -265,6 +288,17 @@ class TestValidateResultForKiploks(unittest.TestCase):
         ok, err = validate_result_for_kiploks(item)
         self.assertFalse(ok)
         self.assertIn("walkForwardAnalysis", err)
+
+    def test_missing_or_empty_oos_trades_fails(self) -> None:
+        item = self._minimal_valid_item()
+        del item["oos_trades"]
+        ok, err = validate_result_for_kiploks(item)
+        self.assertFalse(ok)
+        self.assertIn("oos_trades", err)
+        item["oos_trades"] = []
+        ok, err = validate_result_for_kiploks(item)
+        self.assertFalse(ok)
+        self.assertIn("oos_trades", err)
 
     def test_empty_periods_fails(self) -> None:
         item = self._minimal_valid_item()
