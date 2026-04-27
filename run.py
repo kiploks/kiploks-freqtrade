@@ -2993,9 +2993,20 @@ def upload_to_kiploks(
         "Content-Type": "application/json",
         "Authorization": f"Bearer {api_token}",
     }
+    debug_http = os.getenv("KIPLOKS_DEBUG_HTTP", "").strip().lower() in ("1", "true", "yes", "on")
 
-    def _do_post() -> tuple[int, dict | None, list[str], list[str]]:
-        """Returns (status_code, error_body_or_none, analyze_urls, report_ids)."""
+    def _sanitize_error_text(text: str, *, max_len: int = 1200) -> str:
+        """Hide secrets and truncate oversized response text before logging."""
+        safe = str(text or "")
+        safe = re.sub(r"Bearer\s+[A-Za-z0-9._\-]+", "Bearer ***", safe, flags=re.IGNORECASE)
+        safe = re.sub(r"api[_-]?token[=:\s]+[A-Za-z0-9._\-]+", "api_token=***", safe, flags=re.IGNORECASE)
+        safe = re.sub(r"api[_-]?key[=:\s]+[A-Za-z0-9._\-]+", "api_key=***", safe, flags=re.IGNORECASE)
+        if len(safe) > max_len:
+            return safe[:max_len] + "... (truncated)"
+        return safe
+
+    def _do_post() -> tuple[int, dict | None, str | None, str | None, str | None, list[str], list[str]]:
+        """Returns (status_code, error_body_or_none, error_raw_or_none, server_header_or_none, content_type_or_none, analyze_urls, report_ids)."""
         req = urllib.request.Request(url, data=body, headers=headers, method="POST")
         try:
             with urllib.request.urlopen(req, timeout=60) as resp:
@@ -3007,19 +3018,21 @@ def upload_to_kiploks(
                         urls = []
                     if not isinstance(rids, list):
                         rids = []
-                    return resp.getcode(), None, [str(u) for u in urls], [str(x) for x in rids]
-                return resp.getcode(), None, [], []
+                    return resp.getcode(), None, None, None, None, [str(u) for u in urls], [str(x) for x in rids]
+                return resp.getcode(), None, None, resp.headers.get("Server"), resp.headers.get("Content-Type"), [], []
         except urllib.error.HTTPError as e:
             err_body = None
+            err_raw = None
             try:
                 raw = e.read().decode()
+                err_raw = _sanitize_error_text(raw)
                 err_body = json.loads(raw) if raw.strip() else None
             except Exception:
                 pass
-            return e.code, err_body, [], []
+            return e.code, err_body, err_raw, e.headers.get("Server"), e.headers.get("Content-Type"), [], []
 
     error_lines: list[str] = []
-    code, err_body, urls, report_ids = _do_post()
+    code, err_body, err_raw, err_server, err_content_type, urls, report_ids = _do_post()
     if 200 <= code < 300:
         return True, urls, report_ids, []
 
@@ -3029,7 +3042,7 @@ def upload_to_kiploks(
             print(f"   • Rate limit: next request in {retry_sec}s. Waiting...", file=sys.stderr)
             sys.stderr.flush()
             time.sleep(retry_sec)
-            code, err_body, urls, report_ids = _do_post()
+            code, err_body, err_raw, err_server, err_content_type, urls, report_ids = _do_post()
             if 200 <= code < 300:
                 return True, urls, report_ids, []
             if code == 429:
@@ -3056,8 +3069,19 @@ def upload_to_kiploks(
         return False, [], [], []
 
     error_lines.append(f"Upload failed: HTTP {code} (auth: {_redact_token(api_token)})")
+    error_lines.append(f"   • Upload URL: {url}")
+    if debug_http and err_server:
+        error_lines.append(f"   • Response Server: {err_server}")
+    if debug_http and err_content_type:
+        error_lines.append(f"   • Response Content-Type: {err_content_type}")
     if err_body and err_body.get("message"):
         error_lines.append(f"   • {err_body['message']}")
+    if debug_http and err_raw:
+        error_lines.append(f"   • Raw response: {err_raw}")
+    elif debug_http and code >= 400:
+        error_lines.append("   • Raw response: <empty body>")
+    if not debug_http:
+        error_lines.append("   • Detailed HTTP debug is hidden by default for safety. Set KIPLOKS_DEBUG_HTTP=1 locally to inspect sanitized response headers/body.")
     return False, [], [], error_lines
 
 
