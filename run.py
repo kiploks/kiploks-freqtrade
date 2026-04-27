@@ -1897,7 +1897,13 @@ def scan_backtest_results(user_data: Path, top_n: int) -> list[dict]:
         exchange_from_path = get_exchange_from_backtest_result_path(path)
         effective_exchange = exchange_from_path or exchange_from_config
         file_date = _date_from_backtest_filename(path)
-        mtime = path.stat().st_mtime
+        try:
+            mtime = path.stat().st_mtime
+        except (FileNotFoundError, OSError):
+            # File list can change while scanning (docker mount sync / concurrent writes).
+            # Skip vanished files instead of failing the whole integration run.
+            _log(f"Skipped disappeared backtest file: {path.name}")
+            continue
         embedded_config = _read_config_from_backtest_path(path)
         fee_from_embedded = _fee_slippage_from_config_and_trades(embedded_config, None) if embedded_config else {}
 
