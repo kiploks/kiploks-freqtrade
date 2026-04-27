@@ -9,6 +9,7 @@ No research_id required; you get short analyze links in the response.
 
 Usage: python run.py  (set FREQTRADE_USER_DATA if needed)
 For WFA: run with the same Python/env you use for freqtrade (e.g. activate venv then python run.py), or set FREQTRADE_CMD.
+Export: full payload is always written to kiploks-freqtrade/export_test_result.json (same folder as uploaded.json).
 
 Cross-platform: Path() for paths; Docker mount uses _path_for_docker_mount (Windows -> /mnt/c/...); subprocess always shell=False; all file opens use encoding="utf-8". No fcntl/msvcrt (TOCTOU handled by retry).
 """
@@ -20,6 +21,7 @@ __all__ = [
     "scan_backtest_results",
     "generate_wfa_for_top",
     "upload_to_kiploks",
+    "export_test_result_to_json",
     "load_config",
 ]
 
@@ -276,16 +278,32 @@ def get_exchange_from_backtest_result_path(path: Path) -> str | None:
     return _exchange_name_from_config(_read_config_from_backtest_path(path))
 
 
-def _symbol_to_pair_file(symbol: str) -> str:
-    """BTCUSDT -> BTC_USDT for Freqtrade data filename."""
-    if not symbol or len(symbol) < 4:
-        return "BTC_USDT"
-    s = symbol.strip().upper()
-    for quote in ("USDT", "BUSD", "USDC", "BTC", "ETH"):
-        if s.endswith(quote) and len(s) > len(quote):
-            base = s[: -len(quote)]
-            return f"{base}_{quote}"
+# Default pair when symbol is missing or unparseable (single source for fallbacks).
+_DEFAULT_PAIR = "BTC/USDT"
+
+
+def _symbol_to_pair(symbol: str, ref_market: str | None = None) -> str:
+    """Raw symbol to pair with slash (e.g. BTCUSDT -> BTC/USDT). Same logic as kiploks-octobot for parity."""
+    s = (symbol or "").strip().upper()
+    if not s:
+        return _DEFAULT_PAIR
+    if ref_market:
+        q = ref_market.strip().upper()
+        if q and len(s) > len(q) and s.endswith(q):
+            return f"{s[:-len(q)]}/{q}"
+    for suffix in (
+        "USDT", "USDC", "BUSD", "FDUSD", "DAI",
+        "BTC", "ETH", "BNB", "EUR", "USD", "GBP",
+    ):
+        if len(s) > len(suffix) and s.endswith(suffix):
+            return f"{s[:-len(suffix)]}/{suffix}"
     return s
+
+
+def _symbol_to_pair_file(symbol: str) -> str:
+    """BTCUSDT -> BTC_USDT for Freqtrade data filename. Uses _symbol_to_pair for quote detection."""
+    pair = _symbol_to_pair(symbol)
+    return pair.replace("/", "_")
 
 
 def _candle_timestamp(c: dict) -> int | float | None:
@@ -548,9 +566,9 @@ def _enrich_item_dqg(user_data: Path, item: dict) -> None:
 
 
 def pair_to_symbol(pair: str) -> str:
-    """BTC/USDT -> BTCUSDT."""
+    """BTC/USDT -> BTCUSDT. Fallback uses same default as _symbol_to_pair."""
     if not pair:
-        return "BTCUSDT"
+        return _DEFAULT_PAIR.replace("/", "")
     return pair.replace("/", "").strip().upper()
 
 
@@ -773,8 +791,9 @@ def _print_integration_summary(
     upload_ok: bool,
     analyze_urls: list[str] | None = None,
     deferred_lines: list[str] | None = None,
+    deferred_hyperopt_errors: list[str] | None = None,
 ) -> None:
-    """Print integration summary: each result block first, then any deferred upload/storage lines above the header, then ADVANCED ANALYSIS header, then links."""
+    """Print integration summary: each result block first, then any deferred upload/storage lines, then ADVANCED ANALYSIS header and links; hyperopt errors last so success block stays visible."""
     sep = "-----------------------------------------"
     n = len(items)
     urls = analyze_urls or []
@@ -795,10 +814,26 @@ def _print_integration_summary(
     print("final deployment grade", file=sys.stderr)
     print(file=sys.stderr)
     show_links = can_upload and upload_ok
+    api_url = (kiploks_config.get("api_url") or "").strip()
+    api_token = (kiploks_config.get("api_token") or "").strip()
+    has_cloud_creds = bool(api_url and api_token)
     if not show_links:
-        print("[ 🔑 API key required ]", file=sys.stderr)
-        print("Advanced metrics (DQG Verdict, Robustness Score, WFE, OOS Retention, PSI, Net Edge, Data Drift & Integrity Issues, etc.)", file=sys.stderr)
-        print("Get your key: https://kiploks.com/api-keys", file=sys.stderr)
+        if not has_cloud_creds:
+            print("[ Cloud upload not configured ]", file=sys.stderr)
+            print(
+                "Set api_url (e.g. https://kiploks.com) and api_token in kiploks.json for Advanced metrics on Kiploks Cloud.",
+                file=sys.stderr,
+            )
+            print("Get a key: https://kiploks.com/api-keys", file=sys.stderr)
+        elif not can_upload:
+            print("[ Cloud upload skipped ]", file=sys.stderr)
+            print("Invalid API credentials - see message above. Advanced metrics need a successful Cloud upload.", file=sys.stderr)
+        else:
+            print("[ Cloud upload failed ]", file=sys.stderr)
+            print(
+                "Advanced metrics (DQG, WFE, retention, ...) are computed on Kiploks Cloud after upload succeeds. Fix errors above (HTTP, oos_trades, limits).",
+                file=sys.stderr,
+            )
     else:
         print("Open the analyze link(s) below to see full analysis.", file=sys.stderr)
     print(file=sys.stderr)
@@ -806,6 +841,13 @@ def _print_integration_summary(
         for u in urls:
             print(u, file=sys.stderr)
     print(file=sys.stderr)
+    # Hyperopt errors at the very end so "[OK] Backtest loaded" and summary remain visible.
+    if deferred_hyperopt_errors:
+        print(sep, file=sys.stderr)
+        print("Hyperopt (errors / warnings)", file=sys.stderr)
+        for line in deferred_hyperopt_errors:
+            print(line, file=sys.stderr)
+        print(file=sys.stderr)
     sys.stderr.flush()
 
 
@@ -889,7 +931,7 @@ def _is_exchange_not_available_error(stderr: str) -> bool:
 
 
 def _is_hyperopt_strategy_space_error(stderr: str) -> bool:
-    """True if hyperopt failed because strategy has a space (e.g. 'sell') in hyperopt but no parameters for it."""
+    """True if hyperopt failed because strategy has a space (e.g. 'buy' or 'sell') in hyperopt but no parameters for it."""
     if not stderr:
         return False
     s = stderr.lower()
@@ -898,6 +940,14 @@ def _is_hyperopt_strategy_space_error(stderr: str) -> bool:
         and ("no parameter" in s or "remove the" in s)
         and "hyperopt" in s
     )
+
+
+def _extract_hyperopt_space_name(stderr: str) -> str | None:
+    """Extract space name from Freqtrade error e.g. \"The 'buy' space is included...\". Returns 'buy', 'sell', or None."""
+    if not stderr:
+        return None
+    m = re.search(r"The\s+'(\w+)'\s+space\s+is\s+included", stderr, re.IGNORECASE)
+    return m.group(1).lower() if m else None
 
 
 def _log_exchange_not_available_help(exchange: str | None = None) -> None:
@@ -934,11 +984,19 @@ def _run_hyperopt(
     userdir_for_cmd: str,
     config_path_in_container: str | None,
     config: dict,
+    deferred_error_lines: list[str] | None = None,
 ) -> tuple[bool, bool]:
     """
     Run freqtrade hyperopt via Docker (expects ft_base with mount). Returns (success, no_data).
     no_data True means failure was due to missing OHLCV data (caller can show download-data help).
+    If deferred_error_lines is provided, hyperopt failure messages are appended there instead of logging immediately (so caller can print them at end of run).
     """
+    def _emit(msg: str) -> None:
+        if deferred_error_lines is not None:
+            deferred_error_lines.append(msg)
+        else:
+            _log(msg)
+
     if not strategy_name or not timerange:
         return False, False
     hyperopt_loss = (config.get("hyperopt_loss") or "").strip()
@@ -984,17 +1042,18 @@ def _run_hyperopt(
             err_snippet = combined.strip()
             if len(err_snippet) > 1200:
                 err_snippet = err_snippet[-1200:]
-            _log("   • Hyperopt failed. Check strategy name, timerange, and data. Output:")
-            _log("   •   " + err_snippet.replace("\n", "\n   •   "))
-            _log("   • To reproduce: " + " ".join(full_cmd))
+            _emit("   • Hyperopt failed. Check strategy name, timerange, and data. Output:")
+            _emit("   •   " + err_snippet.replace("\n", "\n   •   "))
+            _emit("   • To reproduce: " + " ".join(full_cmd))
             if _is_hyperopt_strategy_space_error(combined):
-                _log("   • Hint: Your strategy has a hyperopt space (e.g. 'sell') with no parameters. Add parameters for that space or remove it from hyperoptimization in your strategy.")
+                space_name = _extract_hyperopt_space_name(combined) or "buy/sell"
+                _emit(f"   • Hint: Your strategy has a hyperopt space '{space_name}' with no parameters. Add parameters for that space or remove it from hyperoptimization in your strategy.")
         return False, no_data
     except subprocess.TimeoutExpired:
-        _log("   • Hyperopt timed out (run hyperopt manually with fewer epochs).")
+        _emit("   • Hyperopt timed out (run hyperopt manually with fewer epochs).")
         return False, False
     except Exception as e:
-        _log(f"   • Hyperopt exception: {e}")
+        _emit(f"   • Hyperopt exception: {e}")
         return False, False
 
 
@@ -1054,6 +1113,25 @@ def parse_one_backtest_file(path: Path) -> dict | None:
             _log(f"Parse error {path.name}: {e}")
             return None
     return None
+
+
+def _validation_max_dd_from_raw(raw: dict) -> float | None:
+    """Extract max drawdown from raw OOS backtest result; normalize to decimal. For Professional WFA stress test (periods[].validationMaxDD)."""
+    if not raw or not isinstance(raw, dict):
+        return None
+    v = _first_metric_value(raw, "max_drawdown", "max_relative_drawdown", "max_drawdown_account")
+    if v is None and isinstance(raw.get("results"), dict):
+        v = _first_metric_value(raw["results"], "max_drawdown", "max_relative_drawdown", "max_drawdown_account")
+    if v is None:
+        st_list = raw.get("strategy")
+        if isinstance(st_list, list) and st_list and isinstance(st_list[0], dict):
+            v = _first_metric_value(st_list[0], "max_drawdown", "max_relative_drawdown", "max_drawdown_account")
+    if v is None or not isinstance(v, (int, float)) or v != v:
+        return None
+    v = float(v)
+    if v > 1:
+        v = v / 100.0
+    return v if (v == v and abs(v) < 1e15) else None
 
 
 def _profit_factor_from_raw(raw: dict) -> float | None:
@@ -1118,10 +1196,10 @@ def _to_return_decimal(pt: object) -> float | None:
     return v / 100.0
 
 
-def get_profit_total_from_raw(raw: dict) -> float:
-    """Extract total return (decimal) from raw Freqtrade backtest (flat or strategy dict). Tries all known keys."""
+def get_profit_total_from_raw(raw: dict) -> float | None:
+    """Extract total return (decimal) from raw Freqtrade backtest (flat or strategy dict). Returns None if not found."""
     if not raw:
-        return 0.0
+        return None
 
     def _try_return(obj: dict | None, keys: list[str]) -> float | None:
         if not obj or not isinstance(obj, dict):
@@ -1150,7 +1228,7 @@ def get_profit_total_from_raw(raw: dict) -> float:
             dec = _try_return(res, ["profit_total", "profit_ratio", "totalReturn", "total_return"])
             if dec is not None:
                 return dec
-        return 0.0
+        return None
     # Top-level or results sub-dict
     results = raw.get("results")
     dec = _try_return(results, ["profit_total", "profit_ratio", "totalReturn", "total_return", "profit_total_pct"])
@@ -1163,7 +1241,7 @@ def get_profit_total_from_raw(raw: dict) -> float:
         dec = _to_return_decimal(raw["profit_total_pct"])
         if dec is not None:
             return dec
-    return 0.0
+    return None
 
 
 def _is_strategy_result_object(obj: dict) -> bool:
@@ -2193,6 +2271,47 @@ def _trade_timestamp_to_iso(ts: object) -> str | None:
         return None
 
 
+def _freqtrade_trades_to_oos_trades(
+    trades_list: list[dict],
+    initial_balance: float,
+) -> tuple[list[dict], float]:
+    """
+    Convert Freqtrade OOS trades to Kiploks oos_trades format (net_return decimal per trade).
+    Returns (list of {"net_return": float}, balance_after) for chaining across windows.
+    Uses profit_ratio or close_profit if present, else profit_abs / running_balance.
+    """
+    out: list[dict] = []
+    balance = float(initial_balance)
+
+    def _sort_key(x: dict) -> str:
+        ts = x.get("close_date") or x.get("open_date") or x.get("close_timestamp") or x.get("open_timestamp") or 0
+        if isinstance(ts, (int, float)):
+            try:
+                sec = int(ts) / 1000 if ts > 1e12 else int(ts)
+                return datetime.fromtimestamp(sec, tz=timezone.utc).strftime("%Y-%m-%dT%H:%M:%S")
+            except (OSError, OverflowError, ValueError):
+                return "0000-00-00"
+        if hasattr(ts, "isoformat"):
+            return ts.isoformat()
+        return str(ts)
+
+    for t in sorted(trades_list, key=_sort_key):
+        profit_abs = float(t.get("profit_abs", 0) or t.get("profit") or 0)
+        profit_ratio = t.get("profit_ratio") if t.get("profit_ratio") is not None else t.get("close_profit")
+        if profit_ratio is not None:
+            try:
+                net = float(profit_ratio)
+            except (TypeError, ValueError):
+                net = (profit_abs / balance) if balance else 0.0
+        else:
+            net = (profit_abs / balance) if balance else 0.0
+        if not (isinstance(net, (int, float)) and net == net):  # NaN check
+            continue
+        out.append({"net_return": net})
+        balance += profit_abs
+    return out, balance
+
+
 def _trades_to_equity_curve_kiploks(
     trades: list,
     initial_balance: float = 1000.0,
@@ -2246,7 +2365,7 @@ def _run_backtest_for_timerange(
     max_points: int = 200,
     initial_balance: float = 1000.0,
     config_path_in_container: str | None = None,
-) -> tuple[dict | None, list[dict], float]:
+) -> tuple[dict | None, list[dict], float | None]:
     """
     Run Freqtrade backtest for the given timerange. Uses same timeframe as downloaded data (-i).
     Results are read from user_data/backtest_results on host. Returns (raw_result, equity_curve_kiploks, total_return).
@@ -2335,13 +2454,12 @@ def _run_backtest_for_timerange(
                 matching.append((p, raw, mtime))
         if matching:
             from_this_run = [(p, r, m) for p, r, m in matching if m >= run_cutoff]
-            recent = [(p, r, m) for p, r, m in matching if m >= recent_cutoff]
             if from_this_run:
                 used_path, newest, _ = max(from_this_run, key=lambda x: x[2])
-            elif recent:
-                used_path, newest, _ = max(recent, key=lambda x: x[2])
             else:
-                used_path, newest, _ = max(matching, key=lambda x: x[2])
+                # Do not use older files with same date range (could be from previous run)
+                _log("  no result file from this run (mtime >= run start); same-date file from earlier run - re-run backtest or remove old files")
+                return None, [], None
         if newest is None:
             def _safe_st_mtime(px: Path) -> float:
                 try:
@@ -2394,7 +2512,7 @@ def _run_backtest_for_timerange(
     trades = _get_trades_from_raw(newest)
     ret = get_profit_total_from_raw(newest)
     curve = _trades_to_equity_curve_kiploks(trades, initial_balance=initial_balance, max_points=max_points)
-    return newest, curve, ret
+    return newest, curve, ret  # ret may be None if profit_total not found in result
 
 
 def generate_wfa_for_top(
@@ -2478,7 +2596,8 @@ def generate_wfa_for_top(
             _log(f"Result {idx+1}: SKIP invalid dates: {e}")
             continue
         available_days = (end_d - start_d).days
-        min_days_for_one_period = 14  # minimum to split into IS/OOS
+        # Minimum days to form one IS+OOS period (need enough data for both segments).
+        min_days_for_one_period = 14
         if available_days < min_days_for_one_period:
             _print_wfa_progress_clear()
             _log(f"Result {idx+1}: SKIP date range too short ({available_days}d, need >= {min_days_for_one_period}d)")
@@ -2493,6 +2612,7 @@ def generate_wfa_for_top(
             n_periods = max(1, available_days // total_window_days)
         periods = []
         performance_transfer_windows = []
+        all_oos_trades: list[dict] = []
         window_failed = False
         if run_one_short_period:
             is_ratio = is_size_days / total_window_days if total_window_days else 0.75
@@ -2524,6 +2644,9 @@ def generate_wfa_for_top(
                 oos_start_str = oos_start.strftime("%Y-%m-%d")
                 oos_end_str = oos_end.strftime("%Y-%m-%d")
             else:
+                # Defensive: ensure window_start/window_end set even if pre-loop block were removed
+                window_start = start_d
+                window_end = end_d
                 if i > 0:
                     break
             # (is_start_str, is_end_str, oos_start_str, oos_end_str already set above)
@@ -2548,13 +2671,21 @@ def generate_wfa_for_top(
                 _log(f"Window {i+1} failed")
                 window_failed = True
                 break
+            if ret_is is None or ret_oos is None:
+                _print_wfa_progress_clear()
+                _log(f"Window {i+1}: no profit_total in backtest result, skipping period")
+                window_failed = True
+                break
             period_label = f"Period {i + 1}"
             is_trades_list = raw_is.get("trades") if isinstance(raw_is.get("trades"), list) else []
             oos_trades_list = raw_oos.get("trades") if isinstance(raw_oos.get("trades"), list) else []
             is_trades_count = len(is_trades_list)
             oos_trades_count = len(oos_trades_list)
+            chunk, _ = _freqtrade_trades_to_oos_trades(oos_trades_list, initial_balance)
+            all_oos_trades.extend(chunk)
             is_profit_factor = _profit_factor_from_raw(raw_is)
             oos_profit_factor = _profit_factor_from_raw(raw_oos)
+            validation_max_dd = _validation_max_dd_from_raw(raw_oos)
             if not curve_oos or len(curve_oos) < 2:
                 _log(
                     f"   Window {i+1}: WARNING oosEquityCurve empty or single point (curve_len={len(curve_oos) if curve_oos else 0}, oos_trades={oos_trades_count}) - OOS risk metrics (e.g. Max Drawdown) will be n/a on Kiploks. "
@@ -2570,6 +2701,7 @@ def generate_wfa_for_top(
                 "oosTradesCount": oos_trades_count,
                 **({"isProfitFactor": is_profit_factor} if is_profit_factor is not None else {}),
                 **({"oosProfitFactor": oos_profit_factor} if oos_profit_factor is not None else {}),
+                **({"validationMaxDD": validation_max_dd} if validation_max_dd is not None else {}),
             })
             # Attach parameters so backend can compute PSI (same params for all windows = stable)
             period_params = _numeric_params_only(item.get("parameters") or {})
@@ -2581,12 +2713,17 @@ def generate_wfa_for_top(
             periods.append({
                 "startDate": window_start.strftime("%Y-%m-%d"),
                 "endDate": window_end.strftime("%Y-%m-%d"),
+                "isStart": is_start_str,
+                "isEnd": is_end_str,
+                "oosStart": oos_start_str,
+                "oosEnd": oos_end_str,
                 "optimizationReturn": ret_is,
                 "validationReturn": ret_oos,
                 "isTradesCount": is_trades_count,
                 "oosTradesCount": oos_trades_count,
                 **({"isProfitFactor": is_profit_factor} if is_profit_factor is not None else {}),
                 **({"oosProfitFactor": oos_profit_factor} if oos_profit_factor is not None else {}),
+                **({"validationMaxDD": validation_max_dd} if validation_max_dd is not None else {}),
                 **({"parameters": period_params} if period_params else {}),
             })
             print(f"  Result {idx + 1}/{len(backtest_results)}  Window {i + 1}/{n_periods} done", file=sys.stderr)
@@ -2606,6 +2743,11 @@ def generate_wfa_for_top(
                 "pointsPerCurve": points_per_curve,
             }
         item["walkForwardAnalysis"] = wfa_payload
+        item["oos_trades"] = all_oos_trades
+        if not all_oos_trades:
+            _print_wfa_progress_clear()
+            _log(f"Result {idx + 1}: SKIP no OOS trades (backend requires non-empty oos_trades)")
+            continue
         # Explicit date range for backend Data Quality Guard (robustness score)
         cfg = item.get("backtestResult", {}).get("config", {})
         if cfg.get("startDate") and cfg.get("endDate"):
@@ -2662,6 +2804,16 @@ def validate_result_for_kiploks(item: dict) -> tuple[bool, str]:
     wfa = item.get("walkForwardAnalysis")
     if not wfa or not isinstance(wfa, dict):
         return False, "Missing walkForwardAnalysis"
+    oos_trades = item.get("oos_trades")
+    if isinstance(oos_trades, list) and len(oos_trades) > 0:
+        pass  # trade-level OOS present
+    else:
+        # Align with Kiploks API: WFA periods/windows (or performanceTransfer.windows) can substitute empty oos_trades.
+        ptwin = (wfa.get("performanceTransfer") or {}).get("windows") if isinstance(wfa.get("performanceTransfer"), dict) else None
+        if not isinstance(ptwin, list) or len(ptwin) == 0:
+            periods_precheck = wfa.get("periods") or wfa.get("windows") or []
+            if not isinstance(periods_precheck, list) or len(periods_precheck) == 0:
+                return False, "Missing or empty oos_trades and no WFA periods/windows to derive OOS from (server requires one or the other)"
     periods = wfa.get("periods") or wfa.get("windows") or []
     if not periods:
         return False, "Missing walkForwardAnalysis.periods (or .windows)"
@@ -2803,14 +2955,33 @@ def _json_serializable(obj: object, _depth: int = 0) -> object:
     return obj
 
 
+def export_test_result_to_json(
+    results: list[dict],
+    path: Path,
+    config: dict,
+) -> None:
+    """Write the same payload that would be sent to Kiploks API to a JSON file.
+    Path must be under script dir (same as uploaded.json) so it persists when run in Docker."""
+    payload = {
+        "results": _json_serializable(results),
+        "source": "freqtrade",
+        "exported_at": datetime.now(timezone.utc).isoformat(),
+    }
+    path = path.resolve()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(payload, f, ensure_ascii=False, indent=2)
+    _log(f"Exported test result payload to {path} ({len(results)} result(s)).")
+
+
 def upload_to_kiploks(
     api_url: str,
     results: list[dict],
     config: dict,
     *,
     api_token: str,
-) -> tuple[bool, list[str], list[str]]:
-    """POST results to Kiploks integration API. Returns (success, analyze_urls, error_lines to print above ADVANCED ANALYSIS). Handles 429 (retry once) and 403 storage_limit."""
+) -> tuple[bool, list[str], list[str], list[str]]:
+    """POST results to Kiploks integration API. Returns (success, analyze_urls, report_ids, error_lines). Handles 429 (retry once) and 403 storage_limit."""
     base = api_url.rstrip("/")
     url = f"{base}/api/integration/results"
     payload = {
@@ -2823,15 +2994,21 @@ def upload_to_kiploks(
         "Authorization": f"Bearer {api_token}",
     }
 
-    def _do_post() -> tuple[int, dict | None, list[str]]:
-        """Returns (status_code, error_body_or_none, analyze_urls)."""
+    def _do_post() -> tuple[int, dict | None, list[str], list[str]]:
+        """Returns (status_code, error_body_or_none, analyze_urls, report_ids)."""
         req = urllib.request.Request(url, data=body, headers=headers, method="POST")
         try:
             with urllib.request.urlopen(req, timeout=60) as resp:
                 if 200 <= resp.getcode() < 300:
                     data = json.loads(resp.read().decode())
-                    return resp.getcode(), None, data.get("analyzeUrls") or []
-                return resp.getcode(), None, []
+                    urls = data.get("analyzeUrls") or []
+                    rids = data.get("reportIds") or data.get("resultIds") or []
+                    if not isinstance(urls, list):
+                        urls = []
+                    if not isinstance(rids, list):
+                        rids = []
+                    return resp.getcode(), None, [str(u) for u in urls], [str(x) for x in rids]
+                return resp.getcode(), None, [], []
         except urllib.error.HTTPError as e:
             err_body = None
             try:
@@ -2839,12 +3016,12 @@ def upload_to_kiploks(
                 err_body = json.loads(raw) if raw.strip() else None
             except Exception:
                 pass
-            return e.code, err_body, []
+            return e.code, err_body, [], []
 
     error_lines: list[str] = []
-    code, err_body, urls = _do_post()
+    code, err_body, urls, report_ids = _do_post()
     if 200 <= code < 300:
-        return True, urls, []
+        return True, urls, report_ids, []
 
     if code == 429 and err_body:
         retry_sec = err_body.get("retryAfterSeconds")
@@ -2852,17 +3029,17 @@ def upload_to_kiploks(
             print(f"   • Rate limit: next request in {retry_sec}s. Waiting...", file=sys.stderr)
             sys.stderr.flush()
             time.sleep(retry_sec)
-            code, err_body, urls = _do_post()
+            code, err_body, urls, report_ids = _do_post()
             if 200 <= code < 300:
-                return True, urls, []
+                return True, urls, report_ids, []
             if code == 429:
                 print(f"   • Rate limit: still not allowed. Try again later.", file=sys.stderr)
                 sys.stderr.flush()
-                return False, [], []
+                return False, [], [], []
         else:
             print(f"   • Rate limit: only one analyze request per minute.", file=sys.stderr)
             sys.stderr.flush()
-            return False, [], []
+            return False, [], [], []
 
     if code == 403 and err_body and err_body.get("error") == "storage_limit":
         msg = err_body.get("message", "Storage limit reached.")
@@ -2872,16 +3049,71 @@ def upload_to_kiploks(
         error_lines.append(f"Upload failed: HTTP {code} (auth: {_redact_token(api_token)})")
         error_lines.append(f"   • {msg}")
         error_lines.append(f"   • Stored: {current}/{limit}. Requested: {requested}. Delete some tests in Kiploks.")
-        return False, [], error_lines
+        return False, [], [], error_lines
 
     # Do not show auth error message when token was never set (user did not configure api_token).
     if code == 401 and not (api_token and str(api_token).strip()):
-        return False, [], []
+        return False, [], [], []
 
     error_lines.append(f"Upload failed: HTTP {code} (auth: {_redact_token(api_token)})")
     if err_body and err_body.get("message"):
         error_lines.append(f"   • {err_body['message']}")
-    return False, [], error_lines
+    return False, [], [], error_lines
+
+
+def _stamp_kiploks_analyze_urls_on_results(results: list[dict], analyze_urls: list[str]) -> None:
+    """Embed cloud analyze URLs into each result dict (for export_test_result.json and optional local re-POST)."""
+    for j, r in enumerate(results):
+        if j >= len(analyze_urls):
+            break
+        u = str(analyze_urls[j]).strip()
+        if not u or "/analyze/" not in u:
+            continue
+        if u.startswith("https://") and "kiploks.com" in u:
+            r["kiploksAnalyzeUrl"] = u
+
+
+def _patch_local_orchestrator_reports_with_urls(
+    api_url: str,
+    api_token: str,
+    report_ids: list[str],
+    analyze_urls: list[str],
+) -> None:
+    """When api_url points at this orchestrator, attach Kiploks or shell URLs to saved reports via PATCH."""
+    try:
+        host = (urlparse(api_url).hostname or "").lower()
+    except Exception:
+        return
+    local = (
+        host in ("localhost", "127.0.0.1", "host.docker.internal")
+        or host.startswith("172.17.")
+        or host.startswith("172.18.")
+    )
+    if not local:
+        return
+    base = api_url.rstrip("/")
+    for j, rid in enumerate(report_ids):
+        if j >= len(analyze_urls):
+            break
+        u = str(analyze_urls[j]).strip()
+        patch: dict = {}
+        if "/analyze/" in u and "kiploks.com" in u:
+            patch["kiploksAnalyzeUrl"] = u
+        elif "#report=" in u:
+            patch["orchestratorShellUrl"] = u
+        if not patch:
+            continue
+        try:
+            req = urllib.request.Request(
+                f"{base}/api/reports/{rid}",
+                data=json.dumps(patch).encode("utf-8"),
+                headers={"Content-Type": "application/json", "Authorization": f"Bearer {api_token}"},
+                method="PATCH",
+            )
+            with urllib.request.urlopen(req, timeout=30):
+                pass
+        except Exception:
+            pass
 
 
 def main() -> int:
@@ -2906,48 +3138,47 @@ def main() -> int:
         keep_n = 0  # Default: do not leave script-created files; set to N to keep last N
     if isinstance(keep_n, int) and keep_n >= 0:
         prune_kiploks_backtest_files(user_data, keep_n)
-    has_wfa = has_wfa_results(user_data)
-    if has_wfa:
-        print("Scanning backtest results...", file=sys.stderr)
+    # Always generate WFA so we have oos_trades (required by backend). No legacy path from wfa_results folder.
+    print("Scanning backtest results...", file=sys.stderr)
+    sys.stderr.flush()
+    preview = scan_backtest_results(user_data, top_n)
+    wfa_stop = threading.Event()
+    wfa_anim = threading.Thread(target=_run_wfa_dots_animation, args=(wfa_stop,), daemon=True)
+    wfa_anim.start()
+    try:
+        results = generate_wfa_for_top(user_data, top_n, config, prefetched=preview)
+    finally:
+        wfa_stop.set()
+        wfa_anim.join(timeout=1.0)
+        print("\r" + " " * 32 + "\r", end="", file=sys.stderr)
         sys.stderr.flush()
-        base_results = scan_backtest_results(user_data, top_n)
-        wfa_data = collect_wfa_from_folder(user_data)
-        # Attach first WFA to each result if counts match
-        for i, item in enumerate(base_results):
-            if i < len(wfa_data) and wfa_data[i]:
-                item["walkForwardAnalysis"] = {"periods": wfa_data[i].get("periods", [])}
-        results = base_results
-    else:
-        print("Scanning backtest results...", file=sys.stderr)
-        sys.stderr.flush()
-        preview = scan_backtest_results(user_data, top_n)
-        wfa_stop = threading.Event()
-        wfa_anim = threading.Thread(target=_run_wfa_dots_animation, args=(wfa_stop,), daemon=True)
-        wfa_anim.start()
-        try:
-            results = generate_wfa_for_top(user_data, top_n, config, prefetched=preview)
-        finally:
-            wfa_stop.set()
-            wfa_anim.join(timeout=1.0)
-            print("\r" + " " * 32 + "\r", end="", file=sys.stderr)
-            sys.stderr.flush()
-        _print_wfa_progress_clear()
-        if not results:
-            results = preview
-            _log("Analysis failed. Using " + str(len(results)) + " result(s) without walk-forward data (validation will require it).")
+    _print_wfa_progress_clear()
+    if not results:
+        results = preview
+        _log("Analysis failed. Using " + str(len(results)) + " result(s) without walk-forward data (validation will require it).")
     if not results:
         print("No backtest results to send.")
         return 0
     param_sens_msg: str | None = None
+    # Defer hyperopt error output to end of run so "[OK] Backtest loaded" and summary stay visible.
+    hyperopt_deferred_errors: list[str] = []
     # Send raw hyperopt trials for backend to compute parameter sensitivity (no formulas on client). Always attempt.
     path = find_latest_fthypt(user_data, config)
     if not path:
         ft_base = _resolve_freqtrade_cmd()
         use_docker = "docker" in " ".join(ft_base).lower() or "compose" in " ".join(ft_base).lower()
-        if use_docker:
+        run_hyperopt = use_docker or _running_inside_container()
+        if run_hyperopt:
             _log("   • Status: Running hyperopt...")
             repo_root = get_repo_root()
-            ft_base = _docker_cmd_with_project_mount(ft_base, repo_root)
+            if use_docker:
+                ft_base = _docker_cmd_with_project_mount(ft_base, repo_root)
+                userdir_for_cmd = "/app/user_data"
+                config_path_in_container = "/app/user_data/config.json"
+            else:
+                # Inside container (entrypoint python): no mount; use resolved user_data path.
+                userdir_for_cmd = str(user_data.resolve())
+                config_path_in_container = str(user_data / "config.json") if (user_data / "config.json").is_file() else None
             first = results[0]
             strategy_name = _strategy_name_string(first.get("parameters") or {})
             try:
@@ -2964,16 +3195,15 @@ def main() -> int:
                     _log("   • Skipping hyperopt: missing startDate, endDate or timeframe in config.")
                 else:
                     timerange = datetime.strptime(date_from, "%Y-%m-%d").strftime("%Y%m%d") + "-" + datetime.strptime(date_to, "%Y-%m-%d").strftime("%Y%m%d")
-                    userdir_for_cmd = "/app/user_data"
-                    config_path_in_container = "/app/user_data/config.json"
                     ok, no_data = _run_hyperopt(
                         user_data, strategy_name, timerange, timeframe,
                         ft_base, repo_root, userdir_for_cmd, config_path_in_container, config,
+                        deferred_error_lines=hyperopt_deferred_errors,
                     )
                     if ok:
                         _log("   • Status: Hyperopt finished.")
                     else:
-                        _log("   • Status: Hyperopt failed (no data or error). See command above to download data.")
+                        hyperopt_deferred_errors.append("   • Status: Hyperopt failed (no data or error). See command above to download data.")
             else:
                 pass  # strategy_name invalid, hyperopt already skipped above
         else:
@@ -2996,7 +3226,10 @@ def main() -> int:
         else:
             _log(f"   • Need at least 3 epochs, got {len(epochs)} in {path.name}.")
     else:
-        _log("   • No .fthypt file (set hyperopt_result_path or run hyperopt to create one).")
+        if hyperopt_deferred_errors:
+            hyperopt_deferred_errors.append("   • No .fthypt file (set hyperopt_result_path or run hyperopt to create one).")
+        else:
+            _log("   • No .fthypt file (set hyperopt_result_path or run hyperopt to create one).")
     # Normalize parameters.strategy to string for all results (flat format may have dict)
     for r in results:
         if r.get("parameters") is not None:
@@ -3014,6 +3247,15 @@ def main() -> int:
     uploaded_files = [r.get("_source_file") for r in valid_results if r.get("_source_file")]
     for r in valid_results:
         r.pop("_source_file", None)
+
+    # Always write full payload to JSON (same dir as uploaded.json so it persists in Docker).
+    script_dir = Path(__file__).resolve().parent
+    export_path = script_dir / "export_test_result.json"
+    try:
+        export_test_result_to_json(valid_results, export_path, config)
+    except OSError as e:
+        _log(f"Export failed: {e}")
+
     api_token = (config.get("api_token") or "").strip()
     api_url = (config.get("api_url") or "").strip()
     if api_url:
@@ -3023,19 +3265,31 @@ def main() -> int:
             allow_http_dev = host in ("localhost", "127.0.0.1", "host.docker.internal")
             if not allow_http_dev:
                 raise ValueError("api_url must use HTTPS")
-    can_upload = api_url and api_token
+    # Non-zero exit if user configured cloud upload but it did not complete (see main() return at end).
+    upload_intended = bool(api_url and api_token)
+    can_upload = upload_intended
     if can_upload and not _validate_api_credentials(api_url, api_token):
         _log("Invalid API credentials. Skipping upload.")
         can_upload = False
     upload_ok = False
     analyze_urls: list[str] = []
+    upload_report_ids: list[str] = []
     deferred_lines: list[str] = []
     if can_upload:
         status = _fetch_analyze_status(api_url, api_token)
         if status:
             _log_analyze_status(status, deferred_lines)
-        upload_ok, analyze_urls, upload_error_lines = upload_to_kiploks(api_url, valid_results, config, api_token=api_token)
+        upload_ok, analyze_urls, upload_report_ids, upload_error_lines = upload_to_kiploks(
+            api_url, valid_results, config, api_token=api_token
+        )
         deferred_lines.extend(upload_error_lines)
+        if upload_ok and analyze_urls:
+            _stamp_kiploks_analyze_urls_on_results(valid_results, analyze_urls)
+            try:
+                export_test_result_to_json(valid_results, export_path, config)
+            except OSError as e:
+                _log(f"Re-export after upload failed: {e}")
+            _patch_local_orchestrator_reports_with_urls(api_url, api_token, upload_report_ids, analyze_urls)
         if upload_ok and uploaded_files:
             _save_uploaded_manifest(uploaded_files)
     if isinstance(keep_n, int) and keep_n == 0:
@@ -3047,8 +3301,11 @@ def main() -> int:
         upload_ok,
         analyze_urls=analyze_urls if analyze_urls else None,
         deferred_lines=deferred_lines if deferred_lines else None,
+        deferred_hyperopt_errors=hyperopt_deferred_errors if hyperopt_deferred_errors else None,
     )
     sys.stderr.flush()
+    if upload_intended and not upload_ok:
+        return 1
     return 0
 
 
