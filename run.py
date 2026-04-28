@@ -32,6 +32,7 @@ import platform
 import re
 import shlex
 import shutil
+import ssl
 import subprocess
 import sys
 import threading
@@ -2434,14 +2435,11 @@ def _run_backtest_for_timerange(
             + [p for p in bt_dir.glob("*.zip") if _is_real_backtest_file(p)]
             if _path_under(p, bt_resolved)
         ]
-        now_ts = time.time()
-        recent_cutoff = now_ts - 120
-        # Prefer file written by this run (mtime after we started) so we never use an old cached file
+        # Prefer file written by this run (mtime after we started) so we rarely pick a stale same-range file.
         run_cutoff = run_start_time - 3
-        matching: list[tuple[Path, dict, float]] = []
-        for p in all_candidates:
+
+        def _load_raw_at_path(p: Path) -> dict | None:
             raw = None
-            # Skip API for kiploks-*.zip (zip member name does not match; use file parser)
             use_api = not (p.suffix.lower() == ".zip" and p.name.startswith(KIPLOKS_BACKTEST_PREFIX))
             if use_api:
                 runs = load_backtest_via_freqtrade_api(p, initial_balance=initial_balance)
@@ -2449,6 +2447,11 @@ def _run_backtest_for_timerange(
                     raw = _backtest_run_to_raw_like(runs[0])
             if not raw:
                 raw = parse_one_backtest_file(p)
+            return raw if isinstance(raw, dict) else None
+
+        matching: list[tuple[Path, dict, float]] = []
+        for p in all_candidates:
+            raw = _load_raw_at_path(p)
             if not raw:
                 continue
             res_start, res_end = _get_backtest_date_range_from_raw(raw)
@@ -2460,12 +2463,30 @@ def _run_backtest_for_timerange(
                 matching.append((p, raw, mtime))
         if matching:
             from_this_run = [(p, r, m) for p, r, m in matching if m >= run_cutoff]
+            for _poll in range(25):
+                if from_this_run:
+                    break
+                time.sleep(0.25)
+                poll_matching: list[tuple[Path, dict, float]] = []
+                for p, r, _m in matching:
+                    try:
+                        mt = p.stat().st_mtime
+                    except OSError:
+                        mt = 0.0
+                    poll_matching.append((p, r, mt))
+                matching = poll_matching
+                from_this_run = [(p, r, m) for p, r, m in matching if m >= run_cutoff]
             if from_this_run:
                 used_path, newest, _ = max(from_this_run, key=lambda x: x[2])
             else:
-                # Do not use older files with same date range (could be from previous run)
-                _log("  no result file from this run (mtime >= run start); same-date file from earlier run - re-run backtest or remove old files")
-                return None, [], None
+                # Same timerange as an older artifact, Docker mtime lag, or clock skew: backtest exited 0, so take newest match and re-read from disk.
+                _log(
+                    "  no backtest file touched after run start for this timerange; using newest matching file (re-parsed). Remove duplicate same-range results if numbers look wrong."
+                )
+                used_path, _, _ = max(matching, key=lambda x: x[2])
+                newest = _load_raw_at_path(used_path)
+                if not newest:
+                    return None, [], None
         if newest is None:
             def _safe_st_mtime(px: Path) -> float:
                 try:
@@ -2873,19 +2894,79 @@ def _validate_api_credentials(api_url: str, api_token: str) -> bool:
     return True
 
 
+def _dev_ssl_context_for_url(api_url: str) -> ssl.SSLContext | None:
+    """Return relaxed SSL context for local dev hosts with self-signed certs."""
+    try:
+        parsed = urlparse((api_url or "").strip())
+        host = (parsed.hostname or "").lower()
+        if parsed.scheme == "https" and host in ("localhost", "127.0.0.1", "host.docker.internal"):
+            return ssl._create_unverified_context()
+    except Exception:
+        return None
+    return None
+
+
+def _http_headers(api_token: str, *, json_content: bool = False) -> dict:
+    headers = {
+        "Authorization": f"Bearer {api_token}",
+        "Accept": "application/json",
+        "User-Agent": "curl/8.7.1 kiploks-freqtrade/1.0",
+    }
+    if json_content:
+        headers["Content-Type"] = "application/json"
+    return headers
+
+
 def _fetch_analyze_status(api_url: str, api_token: str) -> dict | None:
     """GET /api/integration/analyze-status. Returns parsed JSON or None on error.
     Uses a 15s timeout for the request; DNS resolution time may add to total wait."""
     url = f"{api_url.rstrip('/')}/api/integration/analyze-status"
-    headers = {"Authorization": f"Bearer {api_token}"}
+    headers = _http_headers(api_token)
     req = urllib.request.Request(url, headers=headers, method="GET")
+    ctx = _dev_ssl_context_for_url(api_url)
     try:
-        with urllib.request.urlopen(req, timeout=15) as resp:
+        with urllib.request.urlopen(req, timeout=15, context=ctx) as resp:
             if 200 <= resp.getcode() < 300:
                 return json.loads(resp.read().decode())
     except Exception:
         pass
     return None
+
+
+def _probe_analyze_status(api_url: str, api_token: str) -> tuple[bool, str]:
+    """Connectivity/auth probe for GET /api/integration/analyze-status."""
+    url = f"{api_url.rstrip('/')}/api/integration/analyze-status"
+    headers = _http_headers(api_token)
+    req = urllib.request.Request(url, headers=headers, method="GET")
+    ctx = _dev_ssl_context_for_url(api_url)
+    _log(f"Connectivity check URL: {url}")
+    try:
+        with urllib.request.urlopen(req, timeout=15, context=ctx) as resp:
+            code = resp.getcode()
+            raw = resp.read().decode()
+            body = json.loads(raw) if raw.strip() else {}
+            if 200 <= code < 300:
+                used = body.get("storageUsed", "?") if isinstance(body, dict) else "?"
+                limit = body.get("storageLimit", "?") if isinstance(body, dict) else "?"
+                monthly_used = body.get("monthlyUsed", "?") if isinstance(body, dict) else "?"
+                monthly_limit = body.get("monthlyLimit", "?") if isinstance(body, dict) else "?"
+                return True, (
+                    f"Connectivity check OK (HTTP {code}). "
+                    f"Storage {used}/{limit}. Monthly {monthly_used}/{monthly_limit}."
+                )
+            return False, f"Connectivity check failed: HTTP {code}"
+    except urllib.error.HTTPError as e:
+        body = ""
+        try:
+            body = e.read().decode()
+        except Exception:
+            body = ""
+        if body:
+            body = re.sub(r"Bearer\s+\S+", "Bearer ***", body, flags=re.IGNORECASE)
+            body = body[:500]
+        return False, f"Connectivity check failed: HTTP {e.code}" + (f" body={body}" if body else "")
+    except urllib.error.URLError as e:
+        return False, f"Connectivity check failed: network error: {getattr(e, 'reason', str(e))}"
 
 
 def _log_analyze_status(
@@ -2995,10 +3076,8 @@ def upload_to_kiploks(
         "source": "freqtrade",
     }
     body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
-    headers = {
-        "Content-Type": "application/json",
-        "Authorization": f"Bearer {api_token}",
-    }
+    headers = _http_headers(api_token, json_content=True)
+    ssl_ctx = _dev_ssl_context_for_url(api_url)
     debug_http = os.getenv("KIPLOKS_DEBUG_HTTP", "").strip().lower() in ("1", "true", "yes", "on")
 
     def _sanitize_error_text(text: str, *, max_len: int = 1200) -> str:
@@ -3015,7 +3094,7 @@ def upload_to_kiploks(
         """Returns (status_code, error_body_or_none, error_raw_or_none, server_header_or_none, content_type_or_none, analyze_urls, report_ids)."""
         req = urllib.request.Request(url, data=body, headers=headers, method="POST")
         try:
-            with urllib.request.urlopen(req, timeout=60) as resp:
+            with urllib.request.urlopen(req, timeout=60, context=ssl_ctx) as resp:
                 if 200 <= resp.getcode() < 300:
                     data = json.loads(resp.read().decode())
                     urls = data.get("analyzeUrls") or []
@@ -3036,6 +3115,9 @@ def upload_to_kiploks(
             except Exception:
                 pass
             return e.code, err_body, err_raw, e.headers.get("Server"), e.headers.get("Content-Type"), [], []
+        except urllib.error.URLError as e:
+            reason = _sanitize_error_text(getattr(e, "reason", str(e)))
+            return 0, {"message": f"Network error while connecting to upload endpoint: {reason}"}, reason, None, None, [], []
 
     error_lines: list[str] = []
     code, err_body, err_raw, err_server, err_content_type, urls, report_ids = _do_post()
@@ -3074,7 +3156,10 @@ def upload_to_kiploks(
     if code == 401 and not (api_token and str(api_token).strip()):
         return False, [], [], []
 
-    error_lines.append(f"Upload failed: HTTP {code} (auth: {_redact_token(api_token)})")
+    if code <= 0:
+        error_lines.append(f"Upload failed: Network error (auth: {_redact_token(api_token)})")
+    else:
+        error_lines.append(f"Upload failed: HTTP {code} (auth: {_redact_token(api_token)})")
     error_lines.append(f"   • Upload URL: {url}")
     if debug_http and err_server:
         error_lines.append(f"   • Response Server: {err_server}")
@@ -3099,7 +3184,12 @@ def _stamp_kiploks_analyze_urls_on_results(results: list[dict], analyze_urls: li
         u = str(analyze_urls[j]).strip()
         if not u or "/analyze/" not in u:
             continue
-        if u.startswith("https://") and "kiploks.com" in u:
+        if u.startswith("https://") and (
+            "kiploks.com" in u
+            or "localhost:3300" in u
+            or "127.0.0.1:3300" in u
+            or "host.docker.internal:3300" in u
+        ):
             r["kiploksAnalyzeUrl"] = u
 
 
@@ -3127,7 +3217,12 @@ def _patch_local_orchestrator_reports_with_urls(
             break
         u = str(analyze_urls[j]).strip()
         patch: dict = {}
-        if "/analyze/" in u and "kiploks.com" in u:
+        if "/analyze/" in u and (
+            "kiploks.com" in u
+            or "localhost:3300" in u
+            or "127.0.0.1:3300" in u
+            or "host.docker.internal:3300" in u
+        ):
             patch["kiploksAnalyzeUrl"] = u
         elif "#report=" in u:
             patch["orchestratorShellUrl"] = u
@@ -3137,7 +3232,7 @@ def _patch_local_orchestrator_reports_with_urls(
             req = urllib.request.Request(
                 f"{base}/api/reports/{rid}",
                 data=json.dumps(patch).encode("utf-8"),
-                headers={"Content-Type": "application/json", "Authorization": f"Bearer {api_token}"},
+                headers=_http_headers(api_token, json_content=True),
                 method="PATCH",
             )
             with urllib.request.urlopen(req, timeout=30):
@@ -3150,6 +3245,8 @@ def main() -> int:
     _print_header()
     print("Loading...", file=sys.stderr)
     sys.stderr.flush()
+    upload_only = any(str(a).strip() == "--upload-only" for a in sys.argv[1:])
+    connectivity_check = any(str(a).strip() == "--connectivity-check" for a in sys.argv[1:])
     user_data = get_user_data_root()
     if not user_data.is_dir():
         print("not found user_data folder (expected", user_data, "). Run from repo root.", file=sys.stderr)
@@ -3158,6 +3255,85 @@ def main() -> int:
     if not config:
         print("Config not found or empty (expected kiploks.json in the same folder as run.py). Copy from kiploks.json.example.", file=sys.stderr)
         return 1
+    script_dir = Path(__file__).resolve().parent
+    export_path = script_dir / "export_test_result.json"
+    if connectivity_check:
+        _log("Connectivity-check mode: probing upload endpoint without WFA")
+        api_token = (config.get("api_token") or "").strip()
+        api_url = (config.get("api_url") or "").strip()
+        if not _validate_api_credentials(api_url, api_token):
+            _log("Connectivity check failed: invalid api_url/api_token in kiploks.json")
+            return 1
+        ok, msg = _probe_analyze_status(api_url, api_token)
+        _log(msg)
+        return 0 if ok else 1
+    if upload_only:
+        _log("Upload-only mode: skip WFA/backtest and reuse export_test_result.json")
+        if not export_path.is_file():
+            _log(f"Upload-only failed: file not found: {export_path}")
+            return 1
+        try:
+            exported = json.loads(export_path.read_text(encoding="utf-8"))
+        except Exception as e:
+            _log(f"Upload-only failed: cannot read {export_path}: {e}")
+            return 1
+        results = exported.get("results") if isinstance(exported, dict) else None
+        if not isinstance(results, list) or len(results) == 0:
+            _log("Upload-only failed: export_test_result.json has empty or invalid results[]")
+            return 1
+        valid_results: list[dict] = []
+        for r in results:
+            if isinstance(r, dict):
+                valid_results.append(r)
+        if not valid_results:
+            _log("Upload-only failed: no valid result objects found in export_test_result.json")
+            return 1
+        api_token = (config.get("api_token") or "").strip()
+        api_url = (config.get("api_url") or "").strip()
+        if api_url:
+            parsed = urlparse(api_url)
+            if parsed.scheme != "https":
+                host = (parsed.hostname or "").lower()
+                allow_http_dev = host in ("localhost", "127.0.0.1", "host.docker.internal")
+                if not allow_http_dev:
+                    raise ValueError("api_url must use HTTPS")
+        upload_intended = bool(api_url and api_token)
+        can_upload = upload_intended
+        if can_upload and not _validate_api_credentials(api_url, api_token):
+            _log("Invalid API credentials. Skipping upload.")
+            can_upload = False
+        upload_ok = False
+        analyze_urls: list[str] = []
+        upload_report_ids: list[str] = []
+        deferred_lines: list[str] = []
+        if can_upload:
+            status = _fetch_analyze_status(api_url, api_token)
+            if status:
+                _log_analyze_status(status, deferred_lines)
+            upload_ok, analyze_urls, upload_report_ids, upload_error_lines = upload_to_kiploks(
+                api_url, valid_results, config, api_token=api_token
+            )
+            deferred_lines.extend(upload_error_lines)
+            if upload_ok and analyze_urls:
+                _stamp_kiploks_analyze_urls_on_results(valid_results, analyze_urls)
+                try:
+                    export_test_result_to_json(valid_results, export_path, config)
+                except OSError as e:
+                    _log(f"Re-export after upload failed: {e}")
+                _patch_local_orchestrator_reports_with_urls(api_url, api_token, upload_report_ids, analyze_urls)
+        _print_integration_summary(
+            valid_results,
+            config,
+            can_upload,
+            upload_ok,
+            analyze_urls=analyze_urls if analyze_urls else None,
+            deferred_lines=deferred_lines if deferred_lines else None,
+            deferred_hyperopt_errors=None,
+        )
+        sys.stderr.flush()
+        if upload_intended and not upload_ok:
+            return 1
+        return 0
     top_n = int(config.get("top_n", 3))
     results_dir = user_data / "backtest_results"
     if not results_dir.is_dir():
@@ -3279,8 +3455,6 @@ def main() -> int:
         r.pop("_source_file", None)
 
     # Always write full payload to JSON (same dir as uploaded.json so it persists in Docker).
-    script_dir = Path(__file__).resolve().parent
-    export_path = script_dir / "export_test_result.json"
     try:
         export_test_result_to_json(valid_results, export_path, config)
     except OSError as e:
