@@ -26,6 +26,7 @@ __all__ = [
 ]
 
 import io
+import hashlib
 import json
 import os
 import platform
@@ -1874,7 +1875,7 @@ if _PYDANTIC_AVAILABLE:
             }
 
 
-def scan_backtest_results(user_data: Path, top_n: int) -> list[dict]:
+def scan_backtest_results(user_data: Path, top_n: int, *, include_uploaded: bool = False) -> list[dict]:
     """Scan backtest_results/, parse files (flat or new format), sort by date from filename (freshest first), return top_n as Kiploks items.
     Skips files listed in uploaded.json when skip_already_uploaded is true in config. Attaches _source_file to each item."""
     results_dir = user_data / "backtest_results"
@@ -1890,7 +1891,7 @@ def scan_backtest_results(user_data: Path, top_n: int) -> list[dict]:
     paths = list(results_dir.glob("*.json")) + list(results_dir.glob("*.zip"))
     paths = [p for p in paths if not p.name.startswith(".") and "_config" not in p.name and "_meta" not in p.name and not p.name.endswith(".meta.json")]
     paths = [p for p in paths if _path_under(p, resolved_dir)]
-    if skip_uploaded:
+    if skip_uploaded and not include_uploaded:
         paths = [p for p in paths if p.name not in uploaded_set]
     for path in paths:
         balance = get_initial_balance_from_backtest_result_path(path)
@@ -1927,6 +1928,11 @@ def scan_backtest_results(user_data: Path, top_n: int) -> list[dict]:
                             cfg[k] = v
                 item["backtestResult"] = {**bt, "config": cfg}
                 item["_source_file"] = path.name
+                # BacktestRun uses date_from/date_to; fallback keeps compatibility with older field names.
+                run_date_from = getattr(run, "date_from", getattr(run, "start_date", ""))
+                run_date_to = getattr(run, "date_to", getattr(run, "end_date", ""))
+                artifact_base = f"{path.name}|{run.strategy_name}|{run.symbol}|{run_date_from}|{run_date_to}|{len(candidates)}"
+                item["_artifact_key"] = hashlib.sha1(artifact_base.encode("utf-8")).hexdigest()
                 _enrich_item_dqg(user_data, item)
                 candidates.append(((file_date, mtime), item))
             continue
@@ -1948,12 +1954,43 @@ def scan_backtest_results(user_data: Path, top_n: int) -> list[dict]:
                             cfg[k] = v
                 item["backtestResult"] = {**bt, "config": cfg}
                 item["_source_file"] = path.name
+                p = item.get("parameters") or {}
+                bt = item.get("backtestResult") or {}
+                cfg = bt.get("config") or {}
+                artifact_base = (
+                    f"{path.name}|{p.get('strategy','')}|{p.get('symbol','')}|"
+                    f"{cfg.get('startDate','')}|{cfg.get('endDate','')}|{len(candidates)}"
+                )
+                item["_artifact_key"] = hashlib.sha1(artifact_base.encode("utf-8")).hexdigest()
                 _enrich_item_dqg(user_data, item)
                 sort_key = (file_date, mtime)
                 candidates.append((sort_key, item))
     candidates.sort(key=lambda x: x[0], reverse=True)
     out = [item for _, item in candidates[: top_n]]
     return out
+
+
+def list_backtest_artifacts(user_data: Path, limit: int = 300) -> list[dict]:
+    """Scan backtest results and return lightweight metadata rows for UI selection."""
+    rows: list[dict] = []
+    items = scan_backtest_results(user_data, max(1, int(limit)), include_uploaded=True)
+    for idx, item in enumerate(items):
+        bt = item.get("backtestResult") or {}
+        cfg = bt.get("config") or {}
+        params = item.get("parameters") or {}
+        rows.append(
+            {
+                "artifactKey": str(item.get("_artifact_key") or ""),
+                "sourceFile": str(item.get("_source_file") or ""),
+                "runIndex": idx,
+                "strategy": str(params.get("strategy") or ""),
+                "symbol": str(params.get("symbol") or ""),
+                "startDate": str(cfg.get("startDate") or ""),
+                "endDate": str(cfg.get("endDate") or ""),
+                "profitTotalPct": bt.get("profitTotalPct"),
+            }
+        )
+    return rows
 
 
 def prune_kiploks_backtest_files(user_data: Path, keep_n: int) -> None:
@@ -3242,11 +3279,22 @@ def _patch_local_orchestrator_reports_with_urls(
 
 
 def main() -> int:
+    argv = [str(a).strip() for a in sys.argv[1:]]
+    upload_only = "--upload-only" in argv
+    connectivity_check = "--connectivity-check" in argv
+    list_backtests_json = "--list-backtests-json" in argv
+    selected_artifact_keys: set[str] = set()
+    for a in argv:
+        if a.startswith("--selected-artifact-keys="):
+            raw = a.split("=", 1)[1]
+            for part in raw.split(","):
+                t = part.strip()
+                if t:
+                    selected_artifact_keys.add(t)
+
     _print_header()
     print("Loading...", file=sys.stderr)
     sys.stderr.flush()
-    upload_only = any(str(a).strip() == "--upload-only" for a in sys.argv[1:])
-    connectivity_check = any(str(a).strip() == "--connectivity-check" for a in sys.argv[1:])
     user_data = get_user_data_root()
     if not user_data.is_dir():
         print("not found user_data folder (expected", user_data, "). Run from repo root.", file=sys.stderr)
@@ -3257,6 +3305,10 @@ def main() -> int:
         return 1
     script_dir = Path(__file__).resolve().parent
     export_path = script_dir / "export_test_result.json"
+    if list_backtests_json:
+        rows = list_backtest_artifacts(user_data, limit=500)
+        print("KIPLOKS_BACKTEST_LIST_JSON:" + json.dumps(rows, ensure_ascii=False), flush=True)
+        return 0
     if connectivity_check:
         _log("Connectivity-check mode: probing upload endpoint without WFA")
         api_token = (config.get("api_token") or "").strip()
@@ -3347,7 +3399,18 @@ def main() -> int:
     # Always generate WFA so we have oos_trades (required by backend). No legacy path from wfa_results folder.
     print("Scanning backtest results...", file=sys.stderr)
     sys.stderr.flush()
-    preview = scan_backtest_results(user_data, top_n)
+    if selected_artifact_keys:
+        preview = scan_backtest_results(user_data, 500, include_uploaded=True)
+    else:
+        preview = scan_backtest_results(user_data, top_n)
+    if selected_artifact_keys:
+        selected_preview = [x for x in preview if str(x.get("_artifact_key") or "") in selected_artifact_keys]
+        if not selected_preview:
+            _log("Selected artifact key was not found in backtest scan. Refresh list and retry.")
+            return 1
+        preview = selected_preview
+        top_n = len(preview)
+        _log(f"Selected artifact mode: using {len(preview)} selected item(s); top_n ignored.")
     wfa_stop = threading.Event()
     wfa_anim = threading.Thread(target=_run_wfa_dots_animation, args=(wfa_stop,), daemon=True)
     wfa_anim.start()
@@ -3453,6 +3516,7 @@ def main() -> int:
     uploaded_files = [r.get("_source_file") for r in valid_results if r.get("_source_file")]
     for r in valid_results:
         r.pop("_source_file", None)
+        r.pop("_artifact_key", None)
 
     # Always write full payload to JSON (same dir as uploaded.json so it persists in Docker).
     try:
